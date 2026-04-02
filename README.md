@@ -2,6 +2,8 @@
 
 A standalone Discord bot for setting one-shot and recurring reminders.
 
+slopped by Claude and may contain issues
+
 ## Features
 
 ### One-shot reminders
