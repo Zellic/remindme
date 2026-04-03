@@ -252,7 +252,7 @@ class AutoRemindGroup(app_commands.Group, name="autoremind", description="Manage
         self,
         interaction: discord.Interaction,
         interval: str,
-        message: str,
+        message: Optional[str] = None,
     ) -> None:
         try:
             td = parse_duration(interval)
@@ -273,7 +273,7 @@ class AutoRemindGroup(app_commands.Group, name="autoremind", description="Manage
         interval_sec = int(td.total_seconds())
         ar = AutoReminder(
             interval_seconds=interval_sec,
-            message=message,
+            message=message or "",
             user_id=interaction.user.id,
             source_location=source,
             next_due_time=now_ts + interval_sec,
