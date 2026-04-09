@@ -48,6 +48,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+SOURCE_CHANNEL_PREFIX = "Source channel: "
+FORWARDED_SOURCE_NOTE = "Original message forwarded above."
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -84,7 +87,13 @@ class RemindMeBot(discord.Client):
         self.auto_reminder_manager.load_from_redis()
 
         # Register persistent views/items so buttons survive restarts
-        self.add_view(SnoozeView(reminder_manager=self.reminder_manager, original_source=None))
+        self.add_view(
+            SnoozeView(
+                reminder_manager=self.reminder_manager,
+                original_source=None,
+                forward_source_message=False,
+            )
+        )
         self.add_dynamic_items(AutoRemindStopButton)
 
         if GUILD_OBJECT:
@@ -102,6 +111,7 @@ class RemindMeBot(discord.Client):
     async def _deliver_reminder(self, reminder: Reminder) -> None:
         user = await self.fetch_user(reminder.user_id)
         dm   = await user.create_dm()
+        forwarded_source = await self._maybe_forward_source_message(dm, reminder)
 
         elapsed     = int(datetime.now(tz=timezone.utc).timestamp()) - reminder.src_time
         elapsed_str = human_readable_duration(timedelta(seconds=elapsed))
@@ -109,9 +119,66 @@ class RemindMeBot(discord.Client):
         body = f"Reminder set {elapsed_str} ago is due. Source channel: {reminder.source_location.as_link()}"
         if reminder.message:
             body += f"\n\n>>> {reminder.message}"
+        if forwarded_source:
+            body += f"\n\n{FORWARDED_SOURCE_NOTE}"
 
-        view = SnoozeView(reminder_manager=self.reminder_manager, original_source=reminder.source_location)
+        view = SnoozeView(
+            reminder_manager=self.reminder_manager,
+            original_source=reminder.source_location,
+            forward_source_message=reminder.forward_source_message,
+        )
         await dm.send(body, view=view)
+
+    async def _maybe_forward_source_message(self, dm: discord.DMChannel, reminder: Reminder) -> bool:
+        if not reminder.forward_source_message or reminder.source_location.message_id is None:
+            return False
+
+        channel = self.get_channel(reminder.source_location.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(reminder.source_location.channel_id)
+            except (discord.Forbidden, discord.NotFound) as exc:
+                log.warning(
+                    "Couldn't fetch source channel %s for reminder %s: %s",
+                    reminder.source_location.channel_id,
+                    reminder.uuid,
+                    exc,
+                )
+                return False
+            except discord.HTTPException:
+                log.exception(
+                    "Discord HTTP error while fetching source channel %s for reminder %s",
+                    reminder.source_location.channel_id,
+                    reminder.uuid,
+                )
+                return False
+
+        if not hasattr(channel, "fetch_message"):
+            log.warning(
+                "Source channel %s does not support message fetch for reminder %s",
+                reminder.source_location.channel_id,
+                reminder.uuid,
+            )
+            return False
+
+        try:
+            source_message = await channel.fetch_message(reminder.source_location.message_id)
+            await source_message.forward(dm, fail_if_not_exists=False)
+            return True
+        except (discord.Forbidden, discord.NotFound) as exc:
+            log.warning(
+                "Couldn't forward source message %s for reminder %s: %s",
+                reminder.source_location.message_id,
+                reminder.uuid,
+                exc,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "Discord HTTP error while forwarding source message %s for reminder %s",
+                reminder.source_location.message_id,
+                reminder.uuid,
+            )
+        return False
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
@@ -147,10 +214,17 @@ bot = RemindMeBot()
 # Snooze View (persistent buttons)
 # ---------------------------------------------------------------------------
 class SnoozeView(discord.ui.View):
-    def __init__(self, *, reminder_manager: ReminderManager, original_source: Optional[DiscordMessage]):
+    def __init__(
+        self,
+        *,
+        reminder_manager: ReminderManager,
+        original_source: Optional[DiscordMessage],
+        forward_source_message: bool,
+    ):
         super().__init__(timeout=None)
         self._manager = reminder_manager
         self._source  = original_source
+        self._forward_source_message = forward_source_message
 
         for label, seconds in SNOOZE_DURATIONS:
             btn = discord.ui.Button(
@@ -161,14 +235,33 @@ class SnoozeView(discord.ui.View):
             btn.callback = self._make_callback(label, seconds)
             self.add_item(btn)
 
+    @staticmethod
+    def _source_from_dm(message: Optional[discord.Message]) -> Optional[DiscordMessage]:
+        if message is None:
+            return None
+
+        for line in message.content.splitlines():
+            _, separator, source_link = line.partition(SOURCE_CHANNEL_PREFIX)
+            if separator:
+                return DiscordMessage.from_link(source_link.strip())
+        return None
+
+    @staticmethod
+    def _forwarded_source_marker_present(message: Optional[discord.Message]) -> bool:
+        return message is not None and FORWARDED_SOURCE_NOTE in message.content
+
     def _make_callback(self, label: str, seconds: int):
         async def callback(interaction: discord.Interaction):
             # Preserve the original source through the snooze chain so the
             # link always points back to where the reminder was first created.
-            source = self._source or DiscordMessage(
+            source = self._source or self._source_from_dm(interaction.message) or DiscordMessage(
                 channel_id=interaction.channel_id,
                 guild_id=interaction.guild_id,
                 message_id=interaction.message.id if interaction.message else None,
+            )
+            forward_source_message = (
+                self._forward_source_message
+                or self._forwarded_source_marker_present(interaction.message)
             )
             now_ts = int(datetime.now(tz=timezone.utc).timestamp())
             snooze_msg = (
@@ -182,6 +275,7 @@ class SnoozeView(discord.ui.View):
                 message=snooze_msg,
                 user_id=interaction.user.id,
                 source_location=source,
+                forward_source_message=forward_source_message,
             )
             self._manager.add_reminder(reminder)
             await interaction.response.send_message(
@@ -492,9 +586,10 @@ def _make_context_menu(label: str, seconds: int):
             type=ReminderType.CONTEXT_MENU,
             src_time=now_ts,
             due_time=now_ts + seconds,
-            message="Triggered by context menu.",
+            message="",
             user_id=interaction.user.id,
             source_location=source,
+            forward_source_message=True,
         ))
         await interaction.followup.send(
             f"Reminder scheduled in {human_readable_duration(timedelta(seconds=seconds))}.",

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -53,6 +54,23 @@ class DiscordMessage:
             message_id=d.get("message_id"),
         )
 
+    @classmethod
+    def from_link(cls, link: str) -> Optional["DiscordMessage"]:
+        match = re.fullmatch(
+            r"https://discord\.com/channels/(?P<guild>@me|\d+)/(?P<channel>\d+)(?:/(?P<message>\d+))?",
+            link,
+        )
+        if match is None:
+            return None
+
+        guild_id = match.group("guild")
+        message_id = match.group("message")
+        return cls(
+            channel_id=int(match.group("channel")),
+            guild_id=None if guild_id == "@me" else int(guild_id),
+            message_id=int(message_id) if message_id is not None else None,
+        )
+
 
 @dataclass
 class Reminder:
@@ -62,6 +80,7 @@ class Reminder:
     message: str
     user_id: int
     source_location: DiscordMessage
+    forward_source_message: bool = False
     uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict:
@@ -72,6 +91,7 @@ class Reminder:
             "message":         self.message,
             "user_id":         self.user_id,
             "source_location": self.source_location.to_dict(),
+            "forward_source_message": self.forward_source_message,
             "uuid":            self.uuid,
         }
 
@@ -84,6 +104,7 @@ class Reminder:
             message=d["message"],
             user_id=d["user_id"],
             source_location=DiscordMessage.from_dict(d["source_location"]),
+            forward_source_message=d.get("forward_source_message", False),
             uuid=d["uuid"],
         )
 
